@@ -1,0 +1,748 @@
+#!/usr/bin/env python3
+
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import importlib
+import importlib.util
+import json
+import math
+import os
+import shutil
+import sys
+import tempfile
+import time
+import zipfile
+import traceback
+from fractions import Fraction
+from pathlib import Path
+
+import numpy as np
+
+DEFAULT_DATA = "/-----/input/competitions/google-verifiable-quantum-circuit-compilation"
+try:  
+    HERE = Path(__file__).resolve().parent
+except NameError:
+    HERE = Path.cwd()
+EXTRA_SEARCH_DIRS = [HERE, Path.cwd(), Path("/mnt/user-data/uploads"), Path("/-----/working"), Path("/-----/input")]
+
+SUMMARY: dict = {}
+
+
+def log(*a):
+    print(time.strftime("[%H:%M:%S]"), *a, flush=True)
+
+
+# --------------------------------------------------------------------------- setup
+
+
+def setup_paths(data: Path) -> None:
+    """Make `kickmix` and the verifier packages importable."""
+    for p in (data / "kickmix", data / "verifiers", data):
+        if p.exists() and str(p) not in sys.path:
+            sys.path.insert(0, str(p))
+    try:
+        import kickmix  
+        return
+    except ImportError:
+        pass
+    for wheel_dir in (data / "kickmix", data):
+        wheels = sorted(wheel_dir.rglob("kickmix*.whl")) if wheel_dir.exists() else []
+        if wheels:
+            os.system(f"{sys.executable} -m pip install -q --no-deps {wheels[0]}")
+            break
+    else:
+        os.system(f"{sys.executable} -m pip install -q kickmix")
+    import kickmix  
+
+
+def find_file(name: str, data: Path) -> Path | None:
+    """Locate a helper script by file name under the competition data or nearby."""
+    for root in [data, *EXTRA_SEARCH_DIRS]:
+        if not root.exists():
+            continue
+        direct = root / name
+        if direct.is_file():
+            return direct
+        for dirpath, dirnames, filenames in os.walk(root):
+            depth = Path(dirpath).relative_to(root).parts
+            if len(depth) > 5:
+                dirnames[:] = []
+                continue
+            if name in filenames:
+                return Path(dirpath) / name
+    return None
+
+
+def load_module(name: str, data: Path, alias: str | None = None):
+    path = find_file(name + ".py", data)
+    if path is None:
+        raise FileNotFoundError(f"cannot find {name}.py under {data} or the fallback directories")
+    spec = importlib.util.spec_from_file_location(alias or name, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[alias or name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def import_dfthcsos(data: Path):
+    """Import the `dfthcsos` verifier package (wherever it sits in the data)."""
+    try:
+        return importlib.import_module("dfthcsos.verify")
+    except ImportError:
+        pass
+    for dirpath, dirnames, filenames in os.walk(data):
+        if Path(dirpath).name == "dfthcsos" and "verify.py" in filenames:
+            sys.path.insert(0, str(Path(dirpath).parent))
+            return importlib.import_module("dfthcsos.verify")
+        if len(Path(dirpath).relative_to(data).parts) > 5:
+            dirnames[:] = []
+    raise ImportError("dfthcsos package (verify.py + scoreinfra/) not found in the competition data")
+
+
+def copy_if_exists(src: Path, dst: Path) -> bool:
+    if src.exists():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if src.is_dir():
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+        else:
+            shutil.copy2(src, dst)
+        return True
+    return False
+
+
+# --------------------------------------------------------------------------- invsqrt
+
+
+def invsqrt_estimate(nr, prec, drop: int, xs: np.ndarray, n_p: int, cap: float = 0.97):
+    """Score estimate of a Precision (+ number of dropped low phase bits).
+
+    The fixed-point model reproduces the circuit exactly (see nr_reference_circuit), so the
+    simulated phase error is known in closed form.  Returns None if the error exceeds
+    `cap` * tolerance anywhere on the domain, otherwise (score, info).
+    """
+    try:
+        y = nr.fixed_point_model(n_p, prec, xs)
+    except (OverflowError, ValueError):
+        return None
+    if drop:
+        y = (y >> drop) << drop
+    exact = 1.0 / np.sqrt(xs.astype(np.float64))
+    err = np.abs(y / 2.0 ** prec.output_bits(n_p) - exact)  # turns
+    tol = 2.0 ** -24 * exact
+    if (err > cap * tol).any():
+        return None
+    margin = float((tol - err).min())
+    circuit = build_nr(nr, prec, drop, n_p)
+    st = circuit.operation_statistics()
+    n_rot = st.num_z_pow(min_clifford_hierarchy_level=4)
+    eps = math.pi * margin / max(n_rot, 1)
+    t_cost = st.num_t_like + n_rot * (0.56 * math.log2(1 / eps) + 5.3)
+    score = circuit.num_qubits * (st.num_toffoli_like + t_cost / 4)
+    return score, dict(qubits=circuit.num_qubits, toffoli=int(st.num_toffoli_like), rotations=int(n_rot), eps=eps)
+
+
+def build_nr(nr, prec, drop: int, n_p: int):
+    """Reference NR circuit, skipping the `drop` lowest (negligible) phase bits."""
+    original = nr._phase_by_bits
+
+    def phase_by_bits(builder, y):
+        f = len(y)
+        with builder.mark("phase_by_bits"):
+            for j in range(drop, f):
+                builder.z_pow(y[j], Fraction(2) ** (j - f + 1))
+
+    nr._phase_by_bits = phase_by_bits
+    try:
+        return nr.build_nr_circuit(n_p, prec=prec)
+    finally:
+        nr._phase_by_bits = original
+
+
+def stage_invsqrt(args, data: Path, out: Path):
+    import kickmix as km
+
+    nr = load_module("nr_reference_circuit", data)
+    inv = load_module("verify_submission_invsqrt", data)
+    n_p = 10
+    spec = inv.ProblemSpecInvSqrt.for_n_p(n_p)
+    xs = np.arange(1, spec.max_x + 1, dtype=np.int64)
+
+    best_p, best_d = nr.Precision(), 0
+    best = invsqrt_estimate(nr, best_p, best_d, xs, n_p)
+    log("invsqrt reference:", best)
+    fields = ["delta_bits", "coef_bits", "square_bits", "product_bits", "result_bits"]
+    improved = True
+    while improved:
+        improved = False
+        for f in fields:
+            for step in (-1, -2, -3, +1):
+                cand = dataclasses.replace(best_p, **{f: getattr(best_p, f) + step})
+                r = invsqrt_estimate(nr, cand, best_d, xs, n_p)
+                if r and r[0] < best[0] - 1:
+                    best, best_p, improved = r, cand, True
+                    log(f"  {f}{step:+d} -> {best[0]:.0f}  {best[1]}")
+        for step in (1, 2, 3):
+            r = invsqrt_estimate(nr, best_p, best_d + step, xs, n_p)
+            if r and r[0] < best[0] - 1:
+                best, best_d, improved = r, best_d + step, True
+                log(f"  drop {best_d} low phase bits -> {best[0]:.0f}")
+    log("invsqrt tuned:", best_p, "drop", best_d, "est. score", f"{best[0]:.0f}", best[1])
+
+    circuit = build_nr(nr, best_p, best_d, n_p)
+    path = out / "invsqrt.kmb"
+    circuit.to_file(str(path), format="kmb")
+    SUMMARY["invsqrt"] = dict(precision=dataclasses.asdict(best_p), dropped_bits=best_d, estimated_score=best[0], **best[1])
+
+    if args.invsqrt_shots_per_x:
+        spec = dataclasses.replace(spec, shots_per_x=args.invsqrt_shots_per_x)
+        res = inv.verify(km.Circuit.from_file(str(path), format="kmb"), spec, salt=args.salt, max_workers=args.workers)
+        log("invsqrt verifier:", {k: res[k] for k in ("status", "score", "toffoli_equivalent", "num_qubits")})
+        SUMMARY["invsqrt"]["verified_score"] = res["score"]
+        ref = Path(data / "sample_submission" / "invsqrt.kmb")
+        if ref.exists() and args.compare_sample:
+            ref_res = inv.verify(km.Circuit.from_file(str(ref), format="kmb"), spec, salt=args.salt, max_workers=args.workers)
+            SUMMARY["invsqrt"]["sample_score"] = ref_res["score"]
+            if ref_res["score"] < res["score"]:
+                log("sample invsqrt is better; keeping it")
+                shutil.copy2(ref, path)
+
+
+# --------------------------------------------------------------------------- dqi
+
+
+def build_dqi(dqi_mod, m: int, n: int, degree: int, n_iters: int):
+    import kickmix as km
+
+    b = km.CircuitBuilder()
+    syn = [b.create_quantum_register(degree, name=f"S{i}") for i in range(n)]
+    err = [b.create_classical_register(degree, name=f"E{j}") for j in range(m)]
+    dqi_mod.ProosAndZalkaDecoder(n, km.GF2Field(degree)).build_syndrome_decoding_mbuc(
+        b, syndromes=syn, error_mbuc=err, n_iters=n_iters)
+    return b.finish_circuit()
+
+
+def stage_dqi(args, data: Path, out: Path):
+    import kickmix as km
+
+    dq = load_module("dqi_reference_circuit", data)
+    vd = load_module("verify_submission_dqi", data)
+    m, n, degree = vd.DEFAULT_M, vd.DEFAULT_N, vd.DEFAULT_DEGREE
+    default_iters = dq.default_n_iters(n)
+    path = out / "dqi.kmb"
+
+    def full_verify(circuit):
+        spec = vd.ProblemSpecDQI.benchmark_instance(m=m, n=n, degree=degree)
+        return vd.verify(circuit, spec, salt=args.salt, max_workers=args.workers)
+
+    chosen_iters = default_iters
+    if args.dqi_search:
+       
+        spec = vd.ProblemSpecDQI.benchmark_instance(m=m, n=n, degree=degree, num_shots=256 * args.dqi_screen_batches)
+        probed = {}
+
+        def probe(it):
+            if it in probed:
+                return probed[it]
+            c = build_dqi(dq, m, n, degree, it)
+            try:
+                r = vd.verify(c, spec, salt=args.salt, max_workers=args.workers, log2_delta=-1.0)
+                bad = r["value_errors"] + r["phase_errors"]
+                sc = r.get("score", float("inf")) if bad == 0 else float("inf")
+                log(f"  dqi n_iters={it}: errors={bad} score={sc:.6e} toffoli/shot={r['toffoli_count']:.0f} qubits={r['num_qubits']}")
+            except Exception as ex:  
+                log(f"  dqi n_iters={it}: failed ({str(ex)[:100]})")
+                bad, sc = 1, float("inf")
+            probed[it] = (bad == 0, sc)
+            return probed[it]
+
+        t_start, lo_bad = time.time(), None
+        last_ok = default_iters
+        for it in range(default_iters - args.dqi_step, n - 1, -args.dqi_step):
+            if time.time() - t_start > args.dqi_time_budget:
+                log("  dqi search: time budget reached")
+                break
+            if probe(it)[0]:
+                last_ok = it
+            else:
+                lo_bad = it
+                break
+        if lo_bad is not None:  
+            lo, hi = lo_bad, last_ok
+            while hi - lo > 1 and time.time() - t_start <= args.dqi_time_budget:
+                mid = (lo + hi) // 2
+                if probe(mid)[0]:
+                    hi = mid
+                else:
+                    lo = mid
+            last_ok = hi
+        good = {it: sc for it, (ok, sc) in probed.items() if ok}
+        if good:
+            best_it = min(good, key=good.get)
+            chosen_iters = min(default_iters, max(best_it + args.dqi_margin, best_it))
+            if best_it >= default_iters:
+                chosen_iters = default_iters
+        log(f"  dqi search: best screened n_iters={last_ok}; using {chosen_iters} (margin {args.dqi_margin})")
+    log("dqi n_iters =", chosen_iters)
+    circuit = build_dqi(dq, m, n, degree, chosen_iters)
+    circuit.to_file(str(path), format="kmb")
+    SUMMARY["dqi"] = dict(n_iters=chosen_iters, default_n_iters=default_iters, qubits=circuit.num_qubits,
+                          max_toffoli=int(circuit.operation_statistics().num_toffoli_like))
+
+    if args.dqi_full_verify or (chosen_iters != default_iters and not args.no_dqi_full_verify):
+        res = full_verify(circuit)
+        SUMMARY["dqi"]["verified_score"] = res["score"]
+        log("dqi verifier:", {k: res[k] for k in ("status", "score", "value_errors", "phase_errors", "effective_error_rate")})
+        if chosen_iters != default_iters:  
+            ref = full_verify(build_dqi(dq, m, n, degree, default_iters))
+            SUMMARY["dqi"]["reference_score"] = ref["score"]
+            if ref["score"] <= res["score"]:
+                log("reference iteration count is better; keeping it")
+                build_dqi(dq, m, n, degree, default_iters).to_file(str(path), format="kmb")
+
+
+# --------------------------------------------------------------------------- dfthcsos
+
+
+def decode_vector(words: np.ndarray, tree_edges: np.ndarray, brot: int, n: int) -> np.ndarray:
+    """Exactly the verifier's decoding: v = e_0, then one Givens rotation per tree edge."""
+    v = np.zeros(n)
+    v[0] = 1.0
+    for word, (p, c) in zip(words, tree_edges):
+        th = math.pi * float(word) / 2 ** (brot - 1)
+        cs, sn = math.cos(th), math.sin(th)
+        v[p], v[c] = cs * v[p] - sn * v[c], sn * v[p] + cs * v[c]
+    return v
+
+
+def encode_vectors(vectors: np.ndarray, tree_edges: np.ndarray, brot: int) -> np.ndarray:
+    """Angle words (rows x (N-1)) of unit vectors; inverse of `decode_vector` up to sign.
+
+    Walk the tree edges backwards: after edge (p, c) the child is only touched by this edge,
+    so theta = atan2(v[c], v[p]); undoing the rotation zeroes v[c].  Vectorized over rows.
+    """
+    v = np.array(vectors, dtype=np.float64)
+    v /= np.linalg.norm(v, axis=1, keepdims=True)
+    words = np.zeros((v.shape[0], len(tree_edges)), dtype=np.int64)
+    scale = 2 ** (brot - 1) / math.pi
+    for t in range(len(tree_edges) - 1, -1, -1):
+        p, c = (int(x) for x in tree_edges[t])
+        th = np.arctan2(v[:, c], v[:, p])
+        words[:, t] = np.rint(th * scale).astype(np.int64) % (2 ** brot)
+        cs, sn = np.cos(th), np.sin(th)
+        vp, vc = v[:, p].copy(), v[:, c].copy()
+        v[:, p] = cs * vp + sn * vc
+        v[:, c] = -sn * vp + cs * vc
+    return words
+
+
+def decode_batch(words: np.ndarray, tree_edges: np.ndarray, brot: int, n: int) -> np.ndarray:
+    """Vectorized `decode_vector` over many rows; returns array of shape (n, rows) (column = vector)."""
+    rows = words.shape[0]
+    v = np.zeros((n, rows))
+    v[0] = 1.0
+    ang = math.pi * words.astype(np.float64) / 2 ** (brot - 1)
+    cs_all, sn_all = np.cos(ang), np.sin(ang)
+    for t, (p, c) in enumerate(tree_edges):
+        p, c = int(p), int(c)
+        vp, vc = v[p].copy(), v[c].copy()
+        v[p] = cs_all[:, t] * vp - sn_all[:, t] * vc
+        v[c] = sn_all[:, t] * vp + cs_all[:, t] * vc
+    return v
+
+
+def refine_words(words: np.ndarray, targets: np.ndarray, tree_edges: np.ndarray, brot: int,
+                 passes: int = 4) -> np.ndarray:
+    """Local search on the integer angle words: try word +-1 per edge and keep the change when the
+    decoded vector's |overlap| with the unit target increases.  Plain rounding of each angle
+    ignores how the rounding errors of all 75 angles combine; this removes much of that."""
+    tgt = (targets / np.linalg.norm(targets, axis=1, keepdims=True)).T  # (n, rows)
+    n, mod = tgt.shape[0], 2 ** brot
+    words = words.copy()
+    best = np.abs(np.einsum("ij,ij->j", decode_batch(words, tree_edges, brot, n), tgt))
+    for _ in range(passes):
+        changed = False
+        for t in range(words.shape[1]):
+            for delta in (1, -1):
+                cand = words.copy()
+                cand[:, t] = (cand[:, t] + delta) % mod
+                ov = np.abs(np.einsum("ij,ij->j", decode_batch(cand, tree_edges, brot, n), tgt))
+                better = ov > best + 1e-15
+                if better.any():
+                    words[better], best[better], changed = cand[better], ov[better], True
+        if not changed:
+            break
+    return words
+
+
+def polish_orthogonal(rows: np.ndarray, tol: float = 0.05):
+    """Nearest orthogonal matrix (polar factor) of a square block of nominally orthonormal rows.
+    The one-body vectors are eigenvectors of a symmetric matrix, hence exactly orthonormal; the
+    sample's 12-bit words perturb that.  Returns None if the block is not close to orthogonal."""
+    if rows.shape[0] != rows.shape[1]:
+        return None
+    u, s, vt = np.linalg.svd(rows)
+    if np.abs(s - 1).max() > tol:
+        return None
+    return u @ vt
+
+
+def refit_weights(u_dec, w0, tei, S, maxiter=30, time_budget=1500.0, logf=print,
+                  abort_after=12, abort_above=0.0235):
+    """Re-fit the two-body weights w (R,B,C) for FIXED (already quantized) vectors u_dec (R,B,N) to
+    minimize error_2^2 = || sum_rc X_rc (x) X_rc - (S(x)I + I(x)S)/2 - tei ||_F^2,
+    X_rc = sum_b w_rbc u_rb u_rb^T  (exactly the verifier's definition).  With M the (R*C, N^2)
+    matrix of the vec(X_rc): f = ||M^T M - T||_F^2 and df/dM = 4 M (M^T M - T)."""
+    from scipy.optimize import minimize
+    R, B, N = u_dec.shape
+    C = w0.shape[2]
+    A = (u_dec[:, :, :, None] * u_dec[:, :, None, :]).reshape(R, B, N * N)
+    eye = np.eye(N).ravel()
+    T = np.array(tei, dtype=np.float64).reshape(N * N, N * N)
+    T += 0.5 * np.outer(np.asarray(S, dtype=np.float64).ravel(), eye)
+    T += 0.5 * np.outer(eye, np.asarray(S, dtype=np.float64).ravel())
+    state = dict(best=(np.inf, w0.copy()), scale=None, t0=time.time(), n=0)
+
+    def build_m(w):
+        return np.matmul(w.transpose(0, 2, 1), A).reshape(R * C, N * N)
+
+    def fg(x):
+        w = x.reshape(R, B, C)
+        M = build_m(w)
+        H = M.T @ M
+        H -= T
+        f = float(np.einsum("ij,ij->", H, H))
+        G = (4.0 * (M @ H)).reshape(R, C, N * N)
+        grad = np.matmul(A, G.transpose(0, 2, 1))  # (R, B, C)
+        state["n"] += 1
+        if f < state["best"][0]:
+            state["best"] = (f, w.copy())
+        if state["scale"] is None:
+            state["scale"] = 1.0 / f
+        if state["n"] % 5 == 1:
+            logf(f"    refit eval {state['n']}: err2={math.sqrt(f):.6f}  ({time.time() - state['t0']:.0f}s)")
+        if time.time() - state["t0"] > time_budget:
+            raise TimeoutError
+        if state["n"] == abort_after and math.sqrt(f) > abort_above:
+            logf(f"    refit: err2 still {math.sqrt(f):.5f} > {abort_above} after {abort_after} evals; giving up early")
+            raise TimeoutError
+        return f * state["scale"], (grad * state["scale"]).ravel()
+
+    try:
+        minimize(fg, w0.ravel().astype(np.float64), jac=True, method="L-BFGS-B",
+                 options=dict(maxiter=maxiter, maxfun=int(maxiter * 1.5) + 5, ftol=1e-14, gtol=1e-12))
+    except TimeoutError:
+        logf("    refit: time budget reached")
+    f, w = state["best"]
+    return w, math.sqrt(f)
+
+
+def joint_fit(u0, w0, tei, S, maxiter=60, time_budget=1500.0, target=0.011, logf=print):
+    """Continuous joint optimization of the two-body vectors u (R,B,N; unit-normalized inside) AND the
+    weights w to minimize error_2^2, BEFORE rounding.  Lowers the factorization's own error floor so
+    that there is room for the rounding error at small brot.  Stops once err2 < target (keeps the
+    solution close to the original factorization so the 1-norm Lambda does not drift far)."""
+    from scipy.optimize import minimize
+    R, B, N = u0.shape
+    C = w0.shape[2]
+    eye = np.eye(N).ravel()
+    T = np.array(tei, dtype=np.float64).reshape(N * N, N * N)
+    S64 = np.asarray(S, dtype=np.float64)
+    T += 0.5 * np.outer(S64.ravel(), eye)
+    T += 0.5 * np.outer(eye, S64.ravel())
+    nw = R * B * C
+    state = dict(best=(np.inf, None, None), scale=None, t0=time.time(), n=0)
+
+    def fg(x):
+        w = x[:nw].reshape(R, B, C)
+        z = x[nw:].reshape(R, B, N)
+        nz = np.linalg.norm(z, axis=-1, keepdims=True)
+        u = z / nz
+        A = (u[:, :, :, None] * u[:, :, None, :]).reshape(R, B, N * N)
+        M = np.matmul(w.transpose(0, 2, 1), A).reshape(R * C, N * N)
+        H = M.T @ M
+        H -= T
+        f = float(np.einsum("ij,ij->", H, H))
+        Gm = (4.0 * (M @ H)).reshape(R, C, N * N)
+        grad_w = np.matmul(A, Gm.transpose(0, 2, 1))  # (R, B, C)
+        G4 = Gm.reshape(R, C, N, N)
+        tmp = np.matmul(G4, u.transpose(0, 2, 1)[:, None])  # (R, C, N, B): G_rc u_rb
+        grad_u = 2.0 * np.einsum("rbc,rcpb->rbp", w, tmp)
+        grad_z = (grad_u - u * np.sum(u * grad_u, axis=-1, keepdims=True)) / nz
+        state["n"] += 1
+        if f < state["best"][0]:
+            state["best"] = (f, w.copy(), u.copy())
+        if state["scale"] is None:
+            state["scale"] = 1.0 / f
+        if state["n"] % 5 == 1:
+            logf(f"    joint eval {state['n']}: err2={math.sqrt(f):.6f}  ({time.time() - state['t0']:.0f}s)")
+        if math.sqrt(f) < target or time.time() - state["t0"] > time_budget:
+            raise TimeoutError
+        return f * state["scale"], np.concatenate([grad_w.ravel(), grad_z.ravel()]) * state["scale"]
+
+    x0 = np.concatenate([np.asarray(w0, dtype=np.float64).ravel(), np.asarray(u0, dtype=np.float64).ravel()])
+    try:
+        minimize(fg, x0, jac=True, method="L-BFGS-B",
+                 options=dict(maxiter=maxiter, maxfun=int(maxiter * 1.5) + 5, ftol=1e-14, gtol=1e-12))
+    except TimeoutError:
+        pass
+    f, w, u = state["best"]
+    return u, w, math.sqrt(f)
+
+
+def one_body_from_h1prime(h1_thc, S, beta_1, electrons, W_rc, w, u_dec):
+    """Eigenvectors (as rows) of h1_prime = H1_THC - (eta/2) S + beta_1 I - sum_rc W_rc X_rc, with X_rc
+    built from the decoded two-body vectors; the verifier pairs the one-body rows with exactly these."""
+    R, B, N = u_dec.shape
+    A = (u_dec[:, :, :, None] * u_dec[:, :, None, :]).reshape(R, B, N * N)
+    X = np.matmul(np.asarray(w, dtype=np.float64).transpose(0, 2, 1), A)  # (R, C, N^2)
+    wx = np.einsum("rc,rcp->p", np.asarray(W_rc, dtype=np.float64), X).reshape(N, N)
+    h1p = h1_thc - 0.5 * electrons * S + beta_1 * np.eye(N) - wx
+    _, vecs = np.linalg.eigh(0.5 * (h1p + h1p.T))
+    return vecs.T.copy()
+
+
+def stage_dfthcsos(args, data: Path, out: Path):
+    dv = import_dfthcsos(data)
+    ak_path = find_file("angle_k_reference_circuit.py", data)
+    if ak_path is None:
+        raise FileNotFoundError("angle_k_reference_circuit.py not found")
+    
+    shim = Path(tempfile.mkdtemp()) / "a" / "b" / "c"
+    shim.mkdir(parents=True)
+    shutil.copy2(ak_path, shim / "angle_k_reference_circuit.py")
+    spec = importlib.util.spec_from_file_location("angle_k_reference_circuit", shim / "angle_k_reference_circuit.py")
+    ak = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ak)
+
+    sample = data / "sample_submission" / "dfthcsos"
+    npz_path = sample / "submission.npz"
+    with np.load(npz_path, allow_pickle=False) as z:
+        arrays = {k: np.array(z[k]) for k in z.files}
+    U, tree_edges, base_words = arrays["U"], arrays["tree_edges"].astype(np.int64), arrays["angle_words"].astype(np.int64)
+    R, B, N = U.shape
+    num_vec, num_angles = base_words.shape
+    assert num_vec == N + R * B and num_angles == N - 1, (base_words.shape, U.shape)
+    base_brot = 12
+
+    inputs = dv.load_inputs(str(npz_path))
+
+  
+    two_body = U.reshape(R * B, N)
+    one_body = np.array([decode_vector(w, tree_edges, base_brot, N) for w in base_words[:N]])
+    check = np.array([decode_vector(w, tree_edges, base_brot, N) for w in base_words[N:N + 64]])
+    ov = np.abs(np.einsum("ij,ij->i", check, two_body[:64] / np.linalg.norm(two_body[:64], axis=1, keepdims=True)))
+    log(f"sanity: min overlap sample-words vs U rows = {ov.min():.6f} (should be ~1)")
+    
+    variants = {"raw": one_body}
+    pol = polish_orthogonal(one_body)
+    if pol is not None:
+        variants["polished"] = pol
+        log(f"one-body rows: polar polish moved them by max {np.abs(pol - one_body).max():.2e}")
+    if args.one_body_npy:
+        ex = np.load(args.one_body_npy)
+        assert ex.shape == one_body.shape, (ex.shape, one_body.shape)
+        variants["exact"] = ex
+        log("loaded exact one-body vectors from", args.one_body_npy)
+    vectors = np.vstack([one_body, two_body])
+
+    n_sel = (num_vec - 1).bit_length()
+    n_anc = n_sel - 1
+    candidates = []
+    for brot in range(args.brot_min, args.brot_max + 1):
+        jmax = (128 - n_sel - n_anc) // brot  
+        if jmax < 1:
+            continue
+        K = math.ceil(num_angles / jmax)
+        J = math.ceil(num_angles / K)  
+        candidates.append((brot, J, K))
+    log("dfthcsos candidates (brot, J, K):", candidates)
+
+    results, workdir = [], Path(tempfile.mkdtemp())
+    
+    try:
+        base = dv.verify(str(sample))
+        results.append(dict(brot=base_brot, J=8, score=base["score"], dir=str(sample), baseline=True))
+        log(f"  sample baseline score {base['score']:.6e}")
+    except Exception as ex:  
+        log("  sample baseline failed to verify:", str(ex)[:200])
+
+    seen_words = set()
+    for brot, J, K in candidates:
+        for vname, ob in variants.items():
+            vecs = np.vstack([ob, two_body])
+            words = encode_vectors(vecs, tree_edges, brot)
+            if args.refine:
+                words = refine_words(words, vecs, tree_edges, brot)
+            key = (brot, words.tobytes().__hash__())
+            if key in seen_words:
+                continue
+            seen_words.add(key)
+            tag = f"brot={brot:2d} J={J:2d} K={K:2d} [{vname}]"
+            try:
+                metrics = dv.evaluate_words(inputs, words, tree_edges, brot)
+                if not dv.passes_accuracy(metrics):
+                    log(f"  {tag}: rejected by accuracy gates "
+                        f"(err1={metrics.get('error_1'):.4g}, err2={metrics.get('error_2'):.4g}, gap={metrics.get('E_gap'):.4g})")
+                    continue
+                run = workdir / f"b{brot}_J{J}_{vname}"
+                run.mkdir()
+                circuits = ak.build_angle_k_family(words, brot, J)
+                ak.write_kmx_family(circuits, run, format="kmb", overwrite=True)
+                np.savez(run / "submission.npz", **{**arrays, "angle_words": words, "tree_edges": tree_edges})
+                res = dv.verify(str(run), salt=args.salt) if args.salt else dv.verify(str(run))
+                log(f"  {tag}: score {res['score']:.6e} lambda_eff {res['lambda_eff']:.5f} "
+                    f"qubits {res['num_qubits']} toffoli {res['toffoli_count']}")
+                results.append(dict(brot=brot, J=J, K=K, variant=vname, score=res["score"],
+                                    lambda_eff=res["lambda_eff"], dir=str(run)))
+            except Exception as ex:  # noqa: BLE001
+                log(f"  {tag}: failed: {str(ex)[:200]}")
+
+   
+    refit_list = sorted({int(b) for b in args.refit_brots.split(",") if b.strip()}, reverse=True)
+    u_cont, w_cont = U.astype(np.float64), np.asarray(inputs.w, dtype=np.float64)
+    if refit_list and args.joint_iters > 0:
+        t0 = time.time()
+        u_cont, w_cont, e_cont = joint_fit(u_cont / np.linalg.norm(u_cont, axis=-1, keepdims=True), w_cont,
+                                           inputs.ref["tei"], inputs.S, maxiter=args.joint_iters,
+                                           time_budget=args.joint_time, target=args.joint_target, logf=log)
+        log(f"  joint continuous fit: err2 {e_cont:.5f} in {time.time() - t0:.0f}s")
+    for brot in refit_list:
+        cand = [c for c in candidates if c[0] == brot]
+        if not cand or brot >= base_brot:
+            continue
+        _, J, K = cand[0]
+        tag = f"brot={brot:2d} J={J:2d} K={K:2d} [refit]"
+        try:
+            words_two = encode_vectors(u_cont.reshape(R * B, N), tree_edges, brot)
+            u_dec = decode_batch(words_two, tree_edges, brot, N).T.reshape(R, B, N)
+            t0 = time.time()
+            w_fit, err2_fit = refit_weights(u_dec, w_cont, inputs.ref["tei"], inputs.S,
+                                            maxiter=args.refit_maxiter, time_budget=args.refit_time, logf=log,
+                                            abort_after=args.refit_abort_after, abort_above=args.refit_abort_above)
+            log(f"  {tag}: refit done in {time.time() - t0:.0f}s, own err2={err2_fit:.5f}")
+            w_store = w_fit.astype(arrays["W"].dtype)
+            h2_store = (inputs.W + w_store.astype(np.float64).sum(axis=1)).astype(arrays["H2_I"].dtype)
+            arrays_new = {**arrays, "U": u_cont.astype(arrays["U"].dtype), "W": w_store, "H2_I": h2_store}
+            inputs_new = dv.load_inputs({k: arrays_new[k] for k in ("U", "W", "H2_I", "H1_I", "Hsym_lower")})
+            one = one_body_from_h1prime(inputs_new.ref["h1_thc"], inputs_new.S, inputs_new.beta_1,
+                                        inputs_new.ref["electrons"], inputs_new.W, inputs_new.w, u_dec)
+            words = np.vstack([encode_vectors(one, tree_edges, brot), words_two])
+            metrics = dv.evaluate_words(inputs_new, words, tree_edges, brot)
+            log(f"  {tag}: err1={metrics['error_1']:.5f} err2={metrics['error_2']:.5f} "
+                f"Lambda={metrics['Lambda']:.4f} E_gap={metrics['E_gap']:.5f} lambda_eff={metrics['lambda_eff']:.5f}")
+            if not dv.passes_accuracy(metrics):
+                log(f"  {tag}: rejected by accuracy gates; lower brots will not do better, stopping refit")
+                break
+            run = workdir / f"b{brot}_J{J}_refit"
+            run.mkdir()
+            circuits = ak.build_angle_k_family(words, brot, J)
+            ak.write_kmx_family(circuits, run, format="kmb", overwrite=True)
+            np.savez(run / "submission.npz", **{**arrays_new, "angle_words": words, "tree_edges": tree_edges})
+            res = dv.verify(str(run), salt=args.salt) if args.salt else dv.verify(str(run))
+            log(f"  {tag}: score {res['score']:.6e} lambda_eff {res['lambda_eff']:.5f} "
+                f"qubits {res['num_qubits']} toffoli {res['toffoli_count']}")
+            results.append(dict(brot=brot, J=J, K=K, variant="refit", score=res["score"],
+                                lambda_eff=res["lambda_eff"], dir=str(run)))
+        except Exception as ex:  
+            log(f"  {tag}: failed: {str(ex)[:300]}")
+            break
+
+    if not results:
+        raise RuntimeError("no dfthcsos candidate verified")
+    best = min(results, key=lambda r: r["score"])
+    log(f"dfthcsos best: brot={best['brot']} J={best['J']} score={best['score']:.6e}")
+    dest = out / "dfthcsos"
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True)
+    for f in Path(best["dir"]).iterdir():
+        if f.name.startswith("angle_k_") or f.name == "submission.npz":
+            shutil.copy2(f, dest / f.name)
+    SUMMARY["dfthcsos"] = dict(best=best, tried=results)
+
+
+# --------------------------------------------------------------------------- main
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--data", default=os.environ.get("QC_DATA", DEFAULT_DATA))
+    ap.add_argument("--out", default="/-----/working/submission")
+    ap.add_argument("--zip", default="/-----/working/submission.zip", help="archive ----- scores")
+    ap.add_argument("--summary", default="/-----/working/summary.json")
+    ap.add_argument("--stages", default="invsqrt,dqi,dfthcsos")
+    ap.add_argument("--salt", default="")
+    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--invsqrt-shots-per-x", type=int, default=0, help="0 = skip simulation; multiple of 4")
+    ap.add_argument("--compare-sample", action="store_true", help="also verify the sample invsqrt and keep the better")
+    ap.add_argument("--dqi-search", action="store_true", help="search fewer EEA iterations (did NOT pay off in tests: cliff at 218)")
+    ap.add_argument("--dqi-margin", type=int, default=2, help="iterations added back to the best screened count")
+    ap.add_argument("--dqi-time-budget", type=float, default=1500.0, help="seconds for the screening search")
+    ap.add_argument("--no-dqi-full-verify", action="store_true")
+    ap.add_argument("--dqi-step", type=int, default=6)
+    ap.add_argument("--dqi-screen-batches", type=int, default=2)
+    ap.add_argument("--dqi-full-verify", action="store_true")
+    ap.add_argument("--refit-brots", default="11,10", help="brot values to try with the weight re-fit (\"\" = off)")
+    ap.add_argument("--refit-maxiter", type=int, default=40)
+    ap.add_argument("--joint-iters", type=int, default=60, help="continuous joint (u,w) fit before rounding; 0 = off")
+    ap.add_argument("--joint-time", type=float, default=1500.0)
+    ap.add_argument("--joint-target", type=float, default=0.011, help="stop the joint fit once its err2 is below this")
+    ap.add_argument("--refit-abort-after", type=int, default=12, help="give up if err2 is still above --refit-abort-above after this many evals")
+    ap.add_argument("--refit-abort-above", type=float, default=0.0235)
+    ap.add_argument("--refit-time", type=float, default=1500.0, help="seconds per re-fit")
+    ap.add_argument("--one-body-npy", default="", help="(N,N) exact one-body eigenvectors (rows) from the FCIDUMP")
+    ap.add_argument("--refine", action="store_true", help="experimental +-1 local search on angle words (no gain in synthetic tests)")
+    ap.add_argument("--brot-min", type=int, default=7)
+    ap.add_argument("--brot-max", type=int, default=13)
+    args, _unknown = ap.parse_known_args()  
+
+    data, out = Path(args.data), Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    setup_paths(data)
+
+    stages = {"invsqrt": stage_invsqrt, "dqi": stage_dqi, "dfthcsos": stage_dfthcsos}
+    sample = data / "sample_submission"
+    sample_files = {"invsqrt": ("invsqrt.kmb", out / "invsqrt.kmb"),
+                    "dqi": ("dqi.kmb", out / "dqi.kmb"),
+                    "dfthcsos": ("dfthcsos", out / "dfthcsos")}
+    for name in args.stages.split(","):
+        name = name.strip()
+        log(f"=== stage {name} ===")
+        t0 = time.time()
+        try:
+            stages[name](args, data, out)
+        except Exception:  
+            traceback.print_exc()
+            rel, dst = sample_files[name]
+            ok = copy_if_exists(sample / rel, dst)
+            log(f"stage {name} failed; fell back to the sample submission: {ok}")
+            SUMMARY.setdefault(name, {})["fallback_to_sample"] = ok
+        log(f"stage {name} done in {time.time() - t0:.0f}s")
+
+   
+    for name, (rel, dst) in sample_files.items():
+        if not dst.exists():
+            log(f"{rel} missing from output; copying the sample's")
+            copy_if_exists(sample / rel, dst)
+    Path(args.summary).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.summary).write_text(json.dumps(SUMMARY, indent=2, default=str))
+
+   
+    zip_path = Path(args.zip)
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    if zip_path.exists():
+        zip_path.unlink()
+    with tempfile.TemporaryDirectory() as tmp:
+        for _, (_, dst) in sample_files.items():
+            if dst.exists():
+                copy_if_exists(dst, Path(tmp) / dst.name)
+        shutil.make_archive(str(zip_path.with_suffix("")), "zip", tmp)
+    with zipfile.ZipFile(zip_path) as zf:
+        log("wrote", zip_path, "containing", len(zf.namelist()), "files:", sorted(zf.namelist())[:6], "...")
+
+
+if __name__ == "__main__":
+    main()
